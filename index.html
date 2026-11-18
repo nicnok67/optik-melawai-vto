@@ -75,10 +75,12 @@
   </details>
   <details>
     <summary>Fit tweaks &amp; debug</summary>
+    <label>arm spread <input type="range" id="armSpread" min="0" max="12" step="0.5" value="4"><span id="armSpreadV">4.00</span>°</label>
     <label>width <input type="range" id="fitScale" min="0.8" max="1.8" step="0.01" value="1.2"><span id="fitScaleV">1.20</span></label>
     <label>vertical <input type="range" id="fitY" min="-0.3" max="0.3" step="0.01" value="-0.04"><span id="fitYV">-0.04</span></label>
     <label>depth <input type="range" id="fitZ" min="-0.3" max="0.4" step="0.01" value="0.02"><span id="fitZV">0.02</span></label>
     <label>Face-shaped occlusion <input type="checkbox" id="faceOccOn" checked></label>
+    <label>Ears hide arm ends <input type="checkbox" id="earsOn" checked></label>
     <label>show occluder <input type="checkbox" id="showOcc"></label>
     <label>show tracking dots + crop box <input type="checkbox" id="showDots"></label>
     <label>Dots
@@ -121,6 +123,7 @@ bindRange('lead', v=>ui.lead=v);
 bindRange('minCutoff', v=>fp.minCutoff=v);
 bindRange('beta', v=>fp.beta=v);
 bindRange('fitScale', v=>ui.fitScale=v);
+ui.armSpread = 4; bindRange('armSpread', v=>ui.armSpread=v);
 bindRange('fitY', v=>ui.fitY=v);
 bindRange('fitZ', v=>ui.fitZ=v);
 $('mode').onchange = e => { ui.mode=e.target.value; applyMode(); };
@@ -183,7 +186,7 @@ const MODEL_URL = 'https://cdn.jsdelivr.net/gh/KhronosGroup/glTF-Sample-Assets@4
 // Model is in metres, Y up, front facing +Z, 0.15 m wide; frame bottom at y=0, lens centres ~y=0.029.
 // Our rig unit = outer-eye-corner distance (~9–10 cm). This scale makes it ~real-size at width 1.2.
 const MODEL_SCALE = 9.2, LENS_CENTER_Y = 0.029;
-let realGlasses = null; const lensMats = [];
+let realGlasses = null; const lensMats = []; const armPivots = {};
 new GLTFLoader().load(MODEL_URL, gltf => {
   realGlasses = gltf.scene;
   realGlasses.scale.setScalar(MODEL_SCALE);
@@ -199,6 +202,14 @@ new GLTFLoader().load(MODEL_URL, gltf => {
     }
   });
   fitGroup.add(realGlasses);
+  // Hinge pivots so the arms can be spread a little (model metres: hinge at x=±0.0694, y=0.0356, z=-0.0141).
+  for (const [side, sx] of [['Right', -1], ['Left', 1]]) {
+    const pivot = new THREE.Group(); pivot.position.set(sx * 0.0694, 0.0356, -0.0141);
+    realGlasses.add(pivot); realGlasses.updateMatrixWorld(true);
+    for (const name of ['Earhook' + side, 'Temple' + side]) { const n = realGlasses.getObjectByName(name); if (n && n.parent !== pivot) pivot.attach(n); }
+    armPivots[side] = pivot;
+  }
+  occKey = '';
   applyModel();
 }, undefined, e => { console.error('Model load failed', e); $('model').value = 'simple'; applyModel(); });
 
@@ -229,10 +240,11 @@ const FACE_INSET = 0.03; // push the occluder slightly into the face so frames r
 const faceGeo = new THREE.BufferGeometry();
 faceGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(468 * 3), 3));
 faceGeo.setIndex(new THREE.BufferAttribute(FACE_TRIS, 1));
+let faceShapeVersion = 0; // bumps when the occluder face shape changes
 function setFaceShape(pts) {
   const a = faceGeo.attributes.position.array;
   for (let i = 0; i < 468; i++) { a[i*3] = pts[i][0]; a[i*3+1] = pts[i][1]; a[i*3+2] = pts[i][2] - FACE_INSET; }
-  faceGeo.attributes.position.needsUpdate = true; faceGeo.computeBoundingSphere();
+  faceGeo.attributes.position.needsUpdate = true; faceGeo.computeBoundingSphere(); faceShapeVersion++;
 }
 setFaceShape(CANONICAL_FACE);
 const faceOcc = new THREE.Mesh(faceGeo, occMat); faceOcc.renderOrder = -1; faceOcc.frustumCulled = false;
@@ -241,6 +253,50 @@ headGroup.add(faceOcc);
 const occluder = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 24), occMat);
 occluder.scale.set(0.72, 1.0, 1.05); occluder.position.set(0, -0.25, -1.15); occluder.renderOrder = -1;
 headGroup.add(occluder);
+
+// Keep the invisible head INSIDE the straight arms. If the frame is narrower than the head (small width),
+// the occluder is squeezed sideways just enough that the arms are never swallowed by it. The arms stay
+// straight; the nose area (near the centre line) is barely affected, and the far arm still hides when turning.
+const OCC_RX = 0.72;
+let occKey = '', occSqueeze = 1;
+// Ears: the arm rests on the ear root, so from the front the back part of the arm is hidden by the ear,
+// and when turning, the near arm shows along the head until the ear. Placed relative to the arms.
+const ears = [-1, 1].map(sx => { const e = new THREE.Mesh(new THREE.SphereGeometry(1, 24, 16), occMat); e.renderOrder = -1; e.userData.sx = sx; headGroup.add(e); return e; });
+$('earsOn') && ($('earsOn').onchange = e => ears.forEach(m => m.visible = e.target.checked));
+function fitOccluderToArms() {
+  const glb = !!(realGlasses && realGlasses.visible), fs = ui.fitScale;
+  const key = [glb, fs, ui.fitY, ui.fitZ, faceShapeVersion, ui.armSpread].join();
+  const spread = ui.armSpread * Math.PI / 180;
+  if (armPivots.Right) { armPivots.Right.rotation.y = spread; armPivots.Left.rotation.y = -spread; } // + = outward
+  if (key === occKey) return; occKey = key;
+  // Arm inner surface, arm height band and hinge depth, converted to head units.
+  const inner = (glb ? 0.061 * MODEL_SCALE : 0.65) * fs;
+  const yLo = ((glb ? (-0.02 - LENS_CENTER_Y) * MODEL_SCALE : -0.10) + ui.fitY) * fs;
+  const yHi = ((glb ? (0.06 - LENS_CENTER_Y) * MODEL_SCALE : 0.15) + ui.fitY) * fs;
+  const zBack = ((glb ? -0.014 * MODEL_SCALE : -0.02) + ui.fitZ) * fs - 0.15; // only head points behind the hinge
+  let maxX = 0;
+  const a = faceGeo.attributes.position.array;
+  for (let i = 0; i < 468; i++) { const y = a[i*3+1], z = a[i*3+2]; if (y >= yLo && y <= yHi && z <= zBack) maxX = Math.max(maxX, Math.abs(a[i*3])); }
+  for (let iy = 0; iy <= 6; iy++) for (let iz = 0; iz <= 40; iz++) { // back-of-head ellipsoid at full width
+    const y = yLo + (yHi - yLo) * iy / 6, z = -2.2 + (zBack + 2.2) * iz / 40;
+    const t = 1 - ((y + 0.25) / 1.0) ** 2 - ((z + 1.15) / 1.05) ** 2;
+    if (t > 0) maxX = Math.max(maxX, OCC_RX * Math.sqrt(t));
+  }
+  occSqueeze = maxX > 0 ? Math.min(1, (inner - 0.02) / maxX) : 1;
+  faceOcc.scale.x = occSqueeze; occluder.scale.x = OCC_RX * occSqueeze;
+  // Ears (head units): centred on the arm path, starting halfway back along the arm.
+  const armT = (glb ? 0.014 : 0.02) * fs;                                // arm thickness
+  const hingeZ = ((glb ? -0.014 * MODEL_SCALE : -0.02) + ui.fitZ) * fs;
+  const endZ = ((glb ? -0.157 * MODEL_SCALE : -1.175) + ui.fitZ) * fs;  // back end of the arm
+  const armBackY = ((glb ? (0.005 - LENS_CENTER_Y) * MODEL_SCALE : 0.04) + ui.fitY) * fs;
+  const earFront = hingeZ + 0.5 * (endZ - hingeZ), rz = 0.32, ry = 0.36;
+  for (const e of ears) {
+    const spreadOut = glb ? (hingeZ - (earFront - rz)) * Math.sin(spread) : 0;   // arm is further out at the ear
+    const cx = e.userData.sx * (inner + (glb ? 0.014 * MODEL_SCALE * fs : armT) * 0.5 + spreadOut);
+    e.position.set(cx, armBackY - 0.12, earFront - rz);
+    e.scale.set(0.16, ry, rz);
+  }
+}
 $('faceOccOn').onchange = e => { faceOcc.visible = e.target.checked; };
 
 // Debug: raw landmarks + crop box drawn in the same frame.
@@ -476,6 +532,7 @@ function placeGlasses(ahead) {
   headGroup.scale.setScalar(Math.exp(pose.ls + pose.sls*a));
   headGroup.visible = anchor.visible;
   fitGroup.position.set(0, ui.fitY, ui.fitZ);
+  fitOccluderToArms();
 }
 
 const jit = { prev:null, v:0 };
@@ -590,7 +647,7 @@ function frameBody(now, meta) {
       (st.lat ? `capture→pose ${st.lat.toFixed(1)} ms\n` : '') +
       `crop        ${ui.crop ? (crop.following ? 'following, pred err ' + crop.predErr.toFixed(1) + ' px' : 'searching') : 'off'}\n` + `misses      ${st.missTotal || 0}\n` +
       `head fit    ${ui.rotSrc === 'rigid' ? (rig.acc ? 'learning face ' + rig.accN + '/' + REF_FRAMES : 'rms ' + rig.rms.toFixed(2) + ' px') : '5 points'}\n` +
-      `motion      ${((pose.motion||0)*100).toFixed(0)}% (0 = smoothing, 100 = snappy)\n` + `predict on  ${(pose.gate*100).toFixed(0)}%\n` + `raw jitter  ${jit.v.toFixed(2)}% (hold still)\n` + `face        ${anchor.visible ? 'yes' : 'no'}`;
+      `motion      ${((pose.motion||0)*100).toFixed(0)}% (0 = smoothing, 100 = snappy)\n` + `predict on  ${(pose.gate*100).toFixed(0)}%\n` + `raw jitter  ${jit.v.toFixed(2)}% (hold still)\n` + `head width  ${(occSqueeze * 100).toFixed(0)}% (squeezed to stay inside arms)\n` + `face        ${anchor.visible ? 'yes' : 'no'}`;
   }
 }
 
