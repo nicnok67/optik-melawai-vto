@@ -1,0 +1,7 @@
+.DS_Store
+node_modules/
+*.blend
+*.blend1
+.omc/
+.claude/settings.local.json
+.env

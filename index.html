@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Low-Latency Glasses Try-On</title>
+<style>
+  :root { --bg:#111; --fg:#eee; --panel:rgba(0,0,0,.68); --accent:#4cc2ff; --warn:#ffb020; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui, sans-serif; overflow:hidden; }
+  #stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  #wrap { position:relative; transform:scaleX(-1); /* mirror like a real mirror */ }
+  #wrap video, #wrap canvas { display:block; width:100%; height:100%; position:absolute; inset:0; }
+  #panel { position:fixed; top:12px; left:12px; background:var(--panel); padding:12px 14px; border-radius:10px; width:300px; max-width:calc(100vw - 24px); max-height:calc(100vh - 24px); overflow:auto; z-index:2; }
+  #panel h1 { font-size:15px; margin:0 0 8px; }
+  #panel label { display:flex; justify-content:space-between; align-items:center; gap:8px; margin:6px 0; }
+  #panel input[type=range] { width:120px; }
+  #panel .new { color:var(--accent); font-size:11px; }
+  #stats { font-family:ui-monospace, monospace; font-size:12px; white-space:pre; margin-top:8px; color:var(--accent); }
+  #warn { position:fixed; top:12px; left:50%; transform:translateX(-50%); background:var(--warn); color:#000; padding:8px 14px; border-radius:8px; font-weight:600; z-index:3; display:none; max-width:calc(100vw - 24px); text-align:center; }
+  #start { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; z-index:4; background:var(--bg); }
+  #start button { font-size:18px; padding:14px 28px; border-radius:10px; border:0; background:var(--accent); color:#000; cursor:pointer; }
+  details summary { cursor:pointer; margin-top:6px; }
+</style>
+</head>
+<body>
+<div id="start"><button id="go">Start camera</button></div>
+<div id="warn"></div>
+<div id="stage"><div id="wrap">
+  <video id="video" playsinline muted></video>
+  <canvas id="gl"></canvas>
+</div></div>
+
+<div id="panel">
+  <h1>Glasses try-on: latency lab</h1>
+  <label>Frames
+    <select id="model">
+      <option value="glb" selected>Realistic sunglasses (3D model)</option>
+      <option value="simple">Simple (placeholder)</option>
+    </select>
+  </label>
+  <label>Lens
+    <select id="lens">
+      <option value="dark" selected>Dark sun lens + mirror coating</option>
+      <option value="clear">Clear lens + anti-reflective coating</option>
+    </select>
+  </label>
+  <label>Render mode
+    <select id="mode">
+      <option value="sync" selected>Frame-locked (recommended)</option>
+      <option value="live">Live video + overlay</option>
+    </select>
+  </label>
+  <label>Head fit <span class="new">step 1</span>
+    <select id="rotSrc">
+      <option value="rigid" selected>Rigid 3D fit (38 stable pts)</option>
+      <option value="points">5 landmarks (old)</option>
+    </select>
+  </label>
+  <label>Follow-face crop <span class="new">step 2</span> <input type="checkbox" id="crop" checked></label>
+  <label>Filter <span class="new">step 1</span>
+    <select id="filter">
+      <option value="kalman" selected>Adaptive Kalman (steady + snappy)</option>
+      <option value="euro">One Euro (old)</option>
+      <option value="off">Off (raw)</option>
+    </select>
+  </label>
+  <label>Steadiness (still) <input type="range" id="still" min="0.2" max="5" step="0.1" value="1"><span id="stillV">1.00</span></label>
+  <label>Snappiness (moving) <input type="range" id="move" min="3" max="60" step="1" value="10"><span id="moveV">10</span></label>
+  <label>Prediction (frames) <input type="range" id="lead" min="0" max="1.5" step="0.05" value="0"><span id="leadV">0.00</span></label>
+  <details>
+    <summary>One Euro settings (old filter)</summary>
+    <label>min cutoff <input type="range" id="minCutoff" min="0.1" max="8" step="0.1" value="1.5"><span id="minCutoffV">1.5</span></label>
+    <label>beta <input type="range" id="beta" min="0" max="15" step="0.1" value="4"><span id="betaV">4.00</span></label>
+  </details>
+  <details>
+    <summary>Fit tweaks &amp; debug</summary>
+    <label>width <input type="range" id="fitScale" min="0.8" max="1.8" step="0.01" value="1.2"><span id="fitScaleV">1.20</span></label>
+    <label>vertical <input type="range" id="fitY" min="-0.3" max="0.3" step="0.01" value="-0.04"><span id="fitYV">-0.04</span></label>
+    <label>depth <input type="range" id="fitZ" min="-0.3" max="0.4" step="0.01" value="0.02"><span id="fitZV">0.02</span></label>
+    <label>Face-shaped occlusion <input type="checkbox" id="faceOccOn" checked></label>
+    <label>show occluder <input type="checkbox" id="showOcc"></label>
+    <label>show tracking dots + crop box <input type="checkbox" id="showDots"></label>
+    <label>Dots
+      <select id="dotsMode">
+        <option value="locked" selected>Locked to head (ignore expressions)</option>
+        <option value="raw">Raw tracker output</option>
+      </select>
+    </label>
+    <label>Face shape <button id="relearn" type="button">Re-learn my face</button></label>
+  </details>
+  <div id="stats">loading…</div>
+  <div style="font-size:11px;opacity:.7;margin-top:8px">3D model: "Sunglasses Khronos" by Eric Chadwick, © 2024 Darmstadt Graphics Group GmbH, CC BY 4.0. Logos are Khronos trademarks: demo use only.</div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+  "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.1/vision_bundle.mjs"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { FilesetResolver, FaceLandmarker } from '@mediapipe/tasks-vision';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { FACE_TRIS, CANONICAL_FACE } from './face-mesh.js';
+import { RIGID, IDX, rigidFit, faceBasis, toBasis, qRotate, qConj, sub, add, scl, len, Kalman1D, OneEuro, smoothstep } from './vto-math.js';
+
+const $ = id => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+
+// ---------- UI state ----------
+const ui = { mode:'sync', rotSrc:'rigid', crop:true, filter:'kalman', still:1, move:10, lead:0, fitScale:1.2, fitY:-0.04, fitZ:0.02 };
+const fp = { minCutoff:1.5, beta:4.0 };
+const bindRange = (id, fn) => { const el=$(id); const upd=()=>{ fn(+el.value); const v=$(id+'V'); if(v) v.textContent=(+el.value).toFixed(el.step>=1?0:2); }; el.oninput=upd; upd(); };
+bindRange('still', v=>ui.still=v);
+bindRange('move', v=>ui.move=v);
+bindRange('lead', v=>ui.lead=v);
+bindRange('minCutoff', v=>fp.minCutoff=v);
+bindRange('beta', v=>fp.beta=v);
+bindRange('fitScale', v=>ui.fitScale=v);
+bindRange('fitY', v=>ui.fitY=v);
+bindRange('fitZ', v=>ui.fitZ=v);
+$('mode').onchange = e => { ui.mode=e.target.value; applyMode(); };
+$('rotSrc').onchange = e => { ui.rotSrc=e.target.value; resetTracking(); };
+$('filter').onchange = e => { ui.filter=e.target.value; resetFilters(); };
+$('crop').onchange = e => { ui.crop=e.target.checked; crop.following=false; crop.blend=0; };
+$('showOcc').onchange = e => { occMat.colorWrite = e.target.checked; occMat.opacity = e.target.checked ? .4 : 1; occMat.transparent = e.target.checked; occMat.needsUpdate = true; };
+let showDots = false;
+$('showDots').onchange = e => { showDots = e.target.checked; dots.visible = cropBox.visible = showDots; };
+ui.dots = 'locked';
+$('dotsMode').onchange = e => { ui.dots = e.target.value; };
+$('relearn').onclick = () => resetTracking(); // hold still, neutral face, ~1 s
+
+// ---------- Three.js scene (orthographic, in video-pixel units => exact 2D alignment) ----------
+const video = $('video'), canvas = $('gl');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:true, powerPreference:'high-performance' });
+renderer.setPixelRatio(1); // keep render cheap so tracking gets the time budget
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+const scene = new THREE.Scene();
+let W=640, H=480;
+const cam = new THREE.OrthographicCamera(0, W, 0, -H, 1, 10000);
+cam.position.z = 3000;
+
+// Video background as a texture inside the SAME WebGL frame as the glasses (zero relative lag).
+const vidTex = new THREE.VideoTexture(video);
+vidTex.colorSpace = THREE.SRGBColorSpace;
+vidTex.minFilter = THREE.LinearFilter; vidTex.generateMipmaps = false;
+const bg = new THREE.Mesh(new THREE.PlaneGeometry(1,1), new THREE.MeshBasicMaterial({ map:vidTex, depthWrite:false, toneMapped:false }));
+bg.renderOrder = -2; bg.position.z = -2000;
+scene.add(bg);
+
+// Image-based lighting: a studio-like environment gives the lenses and frame real reflections.
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.0;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 0.6));
+const key = new THREE.DirectionalLight(0xffffff, 1.2); key.position.set(0.3, 1, 1); scene.add(key);
+
+// Glasses: built in "eye-corner units" (outer eye corner distance = 1). Origin = nose bridge.
+const glasses = new THREE.Group();
+const frameMat = new THREE.MeshStandardMaterial({ color:0x1a1a1a, roughness:0.35, metalness:0.2 });
+const lensMat = new THREE.MeshPhysicalMaterial({ color:0x88aacc, transparent:true, opacity:0.18, roughness:0.05, metalness:0, depthWrite:false });
+for (const sx of [-1, 1]) {
+  const rim = new THREE.Mesh(new THREE.TorusGeometry(0.27, 0.028, 12, 48), frameMat);
+  rim.scale.set(1, 0.78, 1); rim.position.set(sx*0.33, 0, 0); glasses.add(rim);
+  const lens = new THREE.Mesh(new THREE.CircleGeometry(0.27, 48), lensMat);
+  lens.scale.set(1, 0.78, 1); lens.position.set(sx*0.33, 0, -0.005); lens.renderOrder = 2; glasses.add(lens);
+  const hinge = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.06, 0.05), frameMat);
+  hinge.position.set(sx*0.64, 0.06, -0.02); glasses.add(hinge);
+  const temple = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.045, 1.15), frameMat);
+  temple.position.set(sx*0.665, 0.04, -0.6); temple.rotation.x = 0.06; glasses.add(temple);
+}
+const bridge = new THREE.Mesh(new THREE.TorusGeometry(0.06, 0.022, 8, 24, Math.PI), frameMat);
+bridge.position.set(0, 0.1, 0); glasses.add(bridge);
+const fitGroup = new THREE.Group(); fitGroup.add(glasses);
+
+// ---------- Realistic 3D frame (glTF with transmission + iridescent lens coating) ----------
+// Pinned to a fixed commit so the asset can't change underneath us.
+const MODEL_URL = 'https://cdn.jsdelivr.net/gh/KhronosGroup/glTF-Sample-Assets@4995a638c96dbc94376d3d6164e70fee3ac7f7a2/Models/SunglassesKhronos/glTF-Binary/SunglassesKhronos.glb';
+// Model is in metres, Y up, front facing +Z, 0.15 m wide; frame bottom at y=0, lens centres ~y=0.029.
+// Our rig unit = outer-eye-corner distance (~9–10 cm). This scale makes it ~real-size at width 1.2.
+const MODEL_SCALE = 9.2, LENS_CENTER_Y = 0.029;
+let realGlasses = null; const lensMats = [];
+new GLTFLoader().load(MODEL_URL, gltf => {
+  realGlasses = gltf.scene;
+  realGlasses.scale.setScalar(MODEL_SCALE);
+  realGlasses.position.set(0, -LENS_CENTER_Y * MODEL_SCALE, 0);
+  realGlasses.traverse(o => {
+    if (!o.isMesh) return;
+    o.frustumCulled = false;
+    const m = o.material;
+    m.envMapIntensity = 1.2;
+    if (/lens/i.test(m.name)) {
+      m.userData.orig = { color: m.color.clone(), iridescence: m.iridescence, roughness: m.roughness };
+      o.renderOrder = 2; lensMats.push(m);
+    }
+  });
+  fitGroup.add(realGlasses);
+  applyModel();
+}, undefined, e => { console.error('Model load failed', e); $('model').value = 'simple'; applyModel(); });
+
+function applyModel() {
+  const useGlb = $('model').value === 'glb' && realGlasses;
+  glasses.visible = !useGlb;
+  if (realGlasses) realGlasses.visible = !!useGlb;
+  const clear = $('lens').value === 'clear';
+  for (const m of lensMats) {
+    const o = m.userData.orig;
+    if (clear) { m.color.set(0xf4f8ff); m.iridescence = 0.35; m.roughness = 0; }   // clear lens, faint AR-coating sheen
+    else { m.color.copy(o.color); m.iridescence = o.iridescence; m.roughness = o.roughness; }
+    m.needsUpdate = true;
+  }
+}
+$('model').onchange = applyModel;
+$('lens').onchange = applyModel;
+
+const anchor = new THREE.Group(); anchor.add(fitGroup); anchor.visible = false; scene.add(anchor);
+
+// ---------- Occlusion: invisible depth-only head so parts of the glasses BEHIND the face are hidden ----------
+// headGroup follows the head pose only (not the glasses fit sliders). Units: eye-corner distance, origin = nose bridge.
+const occMat = new THREE.MeshBasicMaterial({ colorWrite:false, color:0xff00ff, side:THREE.DoubleSide });
+const headGroup = new THREE.Group(); headGroup.visible = false; scene.add(headGroup);
+// 1) Face surface (nose, cheeks, brow): hides the far lens edge behind the nose when you turn.
+//    Starts as MediaPipe's average face, then switches to YOUR learned face shape.
+const FACE_INSET = 0.03; // push the occluder slightly into the face so frames resting on it aren't clipped
+const faceGeo = new THREE.BufferGeometry();
+faceGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(468 * 3), 3));
+faceGeo.setIndex(new THREE.BufferAttribute(FACE_TRIS, 1));
+function setFaceShape(pts) {
+  const a = faceGeo.attributes.position.array;
+  for (let i = 0; i < 468; i++) { a[i*3] = pts[i][0]; a[i*3+1] = pts[i][1]; a[i*3+2] = pts[i][2] - FACE_INSET; }
+  faceGeo.attributes.position.needsUpdate = true; faceGeo.computeBoundingSphere();
+}
+setFaceShape(CANONICAL_FACE);
+const faceOcc = new THREE.Mesh(faceGeo, occMat); faceOcc.renderOrder = -1; faceOcc.frustumCulled = false;
+headGroup.add(faceOcc);
+// 2) Back of the head: hides the far temple arm when the head turns. Kept behind the face surface.
+const occluder = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 24), occMat);
+occluder.scale.set(0.72, 1.0, 1.05); occluder.position.set(0, -0.25, -1.15); occluder.renderOrder = -1;
+headGroup.add(occluder);
+$('faceOccOn').onchange = e => { faceOcc.visible = e.target.checked; };
+
+// Debug: raw landmarks + crop box drawn in the same frame.
+const dotPos = new Float32Array(478*3);
+const dotGeo = new THREE.BufferGeometry(); dotGeo.setAttribute('position', new THREE.BufferAttribute(dotPos, 3));
+const dots = new THREE.Points(dotGeo, new THREE.PointsMaterial({ color:0x00ff66, size:2.5, sizeAttenuation:false, depthTest:false }));
+dots.renderOrder = 10; dots.visible = false; dots.frustumCulled = false; scene.add(dots);
+const boxPos = new Float32Array(4*3);
+const boxGeo = new THREE.BufferGeometry(); boxGeo.setAttribute('position', new THREE.BufferAttribute(boxPos, 3));
+const cropBox = new THREE.LineLoop(boxGeo, new THREE.LineBasicMaterial({ color:0xffcc00, depthTest:false }));
+cropBox.renderOrder = 10; cropBox.visible = false; cropBox.frustumCulled = false; scene.add(cropBox);
+
+function resize() {
+  const s = Math.min(innerWidth/W, innerHeight/H);
+  const wrap = $('wrap'); wrap.style.width = (W*s)+'px'; wrap.style.height = (H*s)+'px';
+  renderer.setSize(W*s, H*s, false);
+}
+addEventListener('resize', resize);
+function applyMode() {
+  bg.visible = ui.mode === 'sync';
+  video.style.visibility = ui.mode === 'sync' ? 'hidden' : 'visible';
+}
+
+// ============================================================
+// STEP 2: Follow-face crop (motion-compensated tracking input)
+// The tracker searches for the face where it was last frame, so fast moves make it slide.
+// We crop the camera image around where the face WILL be (velocity prediction) and feed that
+// crop to the tracker. In crop coordinates the face barely moves, so the tracker stays locked.
+// ============================================================
+const CROP = 384;
+const cropCv = document.createElement('canvas'); cropCv.width = cropCv.height = CROP;
+const cctx = cropCv.getContext('2d', { alpha:false });
+// The tracker ALWAYS sees this square canvas, so its internal "where was the face" memory stays in
+// one coordinate system. Searching = whole frame letterboxed; following = small box on the face.
+// Switching between them is blended over a few frames so that memory is never invalidated (no flicker).
+const crop = { following:false, blend:0, cx:0, cy:0, vx:0, vy:0, side:0, x0:0, y0:0, rs:0, pcx:undefined, pcy:undefined, predErr:0 };
+const searchRect = () => ({ cx: W / 2, cy: H / 2, side: Math.max(W, H) });
+const ramp = (x, lo, hi) => { const t = Math.min(1, Math.max(0, (x - lo) / (hi - lo))); return t * t * (3 - 2 * t); };
+
+function drawCrop(x0, y0, side) {
+  const k = CROP / side;
+  cctx.fillStyle = '#000'; cctx.fillRect(0, 0, CROP, CROP);
+  const sx = Math.max(0, x0), sy = Math.max(0, y0), ex = Math.min(W, x0 + side), ey = Math.min(H, y0 + side);
+  if (ex <= sx || ey <= sy) return false;
+  cctx.drawImage(video, sx, sy, ex - sx, ey - sy, (sx - x0) * k, (sy - y0) * k, (ex - sx) * k, (ey - sy) * k);
+  return true;
+}
+
+function runCrop(r, ts) {
+  // Whole-pixel crop origin/size: sub-pixel resampling shifts make the tracker's output wobble.
+  const side = Math.round(r.side), x0 = Math.round(r.cx - side / 2), y0 = Math.round(r.cy - side / 2);
+  r = { cx: x0 + side / 2, cy: y0 + side / 2, side };
+  if (!drawCrop(x0, y0, side)) return null;
+  crop.x0 = x0; crop.y0 = y0; crop.rs = r.side;
+  const res = landmarker.detectForVideo(cropCv, ts);
+  const lm = res.faceLandmarks && res.faceLandmarks[0];
+  return lm ? lm.map(p => ({ x: (x0 + p.x * r.side) / W, y: (y0 + p.y * r.side) / H, z: p.z * r.side / W })) : null;
+}
+
+// Update crop state from full-frame-normalized landmarks.
+function updateCropState(lm, dt) {
+  let minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
+  for (const p of lm) { const x = p.x * W, y = p.y * H; if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; }
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2, target = 2.0 * Math.max(maxX - minX, maxY - minY);
+  if (!crop.following) { Object.assign(crop, { following:true, blend:0, cx, cy, vx:0, vy:0, side:target, pcx:undefined, ox:undefined }); return; }
+  if (crop.pcx !== undefined) crop.predErr = 0.9 * crop.predErr + 0.1 * Math.hypot(cx - crop.pcx, cy - crop.pcy);
+  crop.vx = 0.4 * crop.vx + 0.6 * (cx - crop.cx) / dt;
+  crop.vy = 0.4 * crop.vy + 0.6 * (cy - crop.cy) / dt;
+  crop.cx = cx; crop.cy = cy;
+  crop.side = 0.85 * crop.side + 0.15 * target;
+}
+
+// Returns landmarks normalized to the FULL frame, or null.
+function track(ts, dt) {
+  if (!ui.crop) { const res = landmarker.detectForVideo(video, ts); return (res.faceLandmarks && res.faceLandmarks[0]) || null; }
+  let r = searchRect();
+  if (crop.following) {
+    // Predict only when clearly moving (noisy velocity would otherwise jiggle the crop every frame).
+    const g = ramp(Math.hypot(crop.vx, crop.vy) / (crop.side / 2), 0.4, 1.5); // face-sizes per second
+    crop.pcx = crop.cx + crop.vx * dt * g; crop.pcy = crop.cy + crop.vy * dt * g; // predicted face centre
+    // Hold the crop STILL while the head is still: move it only when moving fast or drifted past a dead zone.
+    // Glide, don't jump: inside a small dead zone the box stays put (no resampling jitter when still);
+    // outside it the box eases toward the face, faster when the head moves fast.
+    if (crop.ox === undefined) { crop.ox = crop.pcx; crop.oy = crop.pcy; crop.os = crop.side; }
+    const dx = crop.pcx - crop.ox, dy = crop.pcy - crop.oy, d = Math.hypot(dx, dy), dz = 0.025 * crop.os;
+    if (d > dz) { const f = (0.3 + 0.5 * g) * (d - dz) / d; crop.ox += dx * f; crop.oy += dy * f; }
+    const ds = crop.side - crop.os;
+    if (Math.abs(ds) > 0.04 * crop.os) crop.os += ds * 0.15; // ease size changes too
+    crop.blend = Math.min(1, crop.blend + 0.2);
+    const b = crop.blend;
+    r = { cx: r.cx + (crop.ox - r.cx) * b, cy: r.cy + (crop.oy - r.cy) * b, side: r.side + (crop.os - r.side) * b };
+  }
+  let lm = runCrop(r, ts);
+  if (!lm && crop.following) { // lost while following: retry immediately on the whole frame (same camera frame)
+    crop.following = false; crop.blend = 0; crop.pcx = undefined; crop.ox = undefined;
+    lm = runCrop(searchRect(), ts + 0.5);
+  }
+  return lm;
+}
+
+// ============================================================
+// STEP 1a: Rigid 3D head fit on stable landmarks
+// A per-user reference shape is captured on the first frames, then every frame we solve the best
+// rotation+scale+translation (robust, outlier-downweighted) from it to the observed points.
+// ============================================================
+const P = (lm, i) => [lm[i].x * W, -lm[i].y * H, -lm[i].z * W]; // source-pixel space, y up, z toward camera
+const rig = { ref:null, acc:null, accChin:null, accAll:null, accN:0, rms:0, dots:null };
+const REF_FRAMES = 30;
+
+function initReference(lm) {
+  const b = RIGID.map(i => P(lm, i));
+  const B = faceBasis(P(lm, 33), P(lm, 263), P(lm, 10), P(lm, 152));
+  const S = len(sub(P(lm, 263), P(lm, 33)));
+  const c = b.reduce((m, p) => add(m, scl(p, 1 / b.length)), [0, 0, 0]);
+  rig.ref = b.map(p => scl(toBasis(B, sub(p, c)), 1 / S));
+  rig.acc = rig.ref.map(() => [0, 0, 0]); rig.accChin = [0, 0, 0]; rig.accN = 0;
+  rig.accAll = lm.map(() => [0, 0, 0]); rig.dots = null;
+}
+
+// Average the first frames (aligned) into a low-noise reference, then re-derive its face axes.
+function refineReference(lm, f) {
+  const toRef = p => add(scl(qRotate(qConj(f.q), sub(p, f.cb)), 1 / f.s), f.ca);
+  RIGID.forEach((i, k) => { rig.acc[k] = add(rig.acc[k], toRef(P(lm, i))); });
+  rig.accChin = add(rig.accChin, toRef(P(lm, 152)));
+  for (let i = 0; i < lm.length && i < rig.accAll.length; i++) rig.accAll[i] = add(rig.accAll[i], toRef(P(lm, i)));
+  if (++rig.accN < REF_FRAMES) return;
+  const avg = rig.acc.map(p => scl(p, 1 / REF_FRAMES)), chin = scl(rig.accChin, 1 / REF_FRAMES);
+  const B = faceBasis(avg[IDX.eyeR], avg[IDX.eyeL], avg[IDX.top], chin);
+  const S = len(sub(avg[IDX.eyeL], avg[IDX.eyeR]));
+  const c = avg.reduce((m, p) => add(m, scl(p, 1 / avg.length)), [0, 0, 0]);
+  rig.ref = avg.map(p => scl(toBasis(B, sub(p, c)), 1 / S));
+  // Whole-face shape (all 478 points) in head coordinates, relative to the glasses anchor, in eye-width units.
+  // Drawn through the head pose, these "locked" dots follow head motion only: expressions can't move them.
+  const eye = len(sub(rig.ref[IDX.eyeL], rig.ref[IDX.eyeR])), a0 = rig.ref[IDX.anchor];
+  rig.dots = rig.accAll.map(p => scl(sub(scl(toBasis(B, sub(scl(p, 1 / REF_FRAMES), c)), 1 / S), a0), 1 / eye));
+  rig.acc = null; rig.accAll = null; // done
+  setFaceShape(rig.dots); // occluder now uses YOUR face shape
+}
+
+// Returns raw pose: p (anchor in px), s (eye-corner distance in px), q (THREE.Quaternion, face->world)
+function measurePose(lm) {
+  if (ui.rotSrc === 'points') {
+    const B = faceBasis(P(lm, 33), P(lm, 263), P(lm, 10), P(lm, 152));
+    const m = new THREE.Matrix4().makeBasis(new THREE.Vector3(...B[0]), new THREE.Vector3(...B[1]), new THREE.Vector3(...B[2]));
+    return { p: P(lm, 168), s: len(sub(P(lm, 263), P(lm, 33))), q: new THREE.Quaternion().setFromRotationMatrix(m) };
+  }
+  if (!rig.ref) initReference(lm);
+  const f = rigidFit(rig.ref, RIGID.map(i => P(lm, i)), 2);
+  if (rig.acc) refineReference(lm, f);
+  rig.rms = 0.9 * rig.rms + 0.1 * f.rms;
+  const p = add(f.cb, scl(qRotate(f.q, sub(rig.ref[IDX.anchor], f.ca)), f.s));
+  const s = f.s * len(sub(rig.ref[IDX.eyeL], rig.ref[IDX.eyeR]));
+  return { p, s, q: new THREE.Quaternion(f.q[1], f.q[2], f.q[3], f.q[0]) };
+}
+
+// ============================================================
+// STEP 1b: Kalman filter (smooths AND estimates velocity => predicts ahead without lag)
+// ============================================================
+const euroPos = { get minCutoff(){return fp.minCutoff}, get beta(){return fp.beta/Math.max(1,pose.sRaw)}, dCutoff:1 };
+const euroRot = { get minCutoff(){return fp.minCutoff}, get beta(){return fp.beta*3}, dCutoff:1 };
+class Channel {
+  constructor(euroP) { this.kf = new Kalman1D(); this.ef = new OneEuro(euroP); this.prev = null; this.rv = 0; }
+  reset() { this.kf.reset(); this.ef.reset(); this.prev = null; this.rv = 0; }
+  nis(z, dt, sigM, sigStill) { return this.kf.nis(z, dt, sigM, sigStill); }
+  step(z, dt, sigM, sigStill, sigMove, boost) { // -> [value, velocity]
+    if (this.prev !== null) this.rv = 0.4 * this.rv + 0.6 * (z - this.prev) / dt;
+    this.prev = z;
+    if (ui.filter === 'kalman') { this.kf.stepAdaptive(z, dt, sigM, sigStill, sigMove, boost); return [this.kf.x, this.kf.v]; }
+    if (ui.filter === 'euro') { const x = this.ef.filter(z, dt); return [x, this.ef.v]; }
+    return [z, this.rv];
+  }
+}
+const ch = { p:[0,1,2].map(()=>new Channel(euroPos)), ls:new Channel(euroPos), q:[0,1,2,3].map(()=>new Channel(euroRot)) };
+const pose = { valid:false, p:[0,0,0], vp:[0,0,0], ls:0, vls:0, q:[0,0,0,1], vq:[0,0,0,0], sRaw:100,
+  sp:[0,0,0], sq:[0,0,0,0], sls:0, gate:0 }; // s* = extra-smoothed velocities used ONLY for prediction
+function resetFilters() { ch.p.forEach(c=>c.reset()); ch.ls.reset(); ch.q.forEach(c=>c.reset()); pose.valid = false; }
+function resetTracking() { resetFilters(); rig.ref = null; rig.acc = null; rig.accAll = null; rig.dots = null; setFaceShape(CANONICAL_FACE); }
+
+function updatePose(raw, dt) {
+  const S = raw.s; pose.sRaw = S;
+  // Adaptive Kalman: heavy smoothing while still (ui.still), snappy while moving (ui.move).
+  // Noise/acceleration are normalized by face size so tuning is distance-independent.
+  const lo = ui.still, hi = ui.move;
+  const q = [raw.q.x, raw.q.y, raw.q.z, raw.q.w];
+  if (pose.valid && q[0]*pose.q[0] + q[1]*pose.q[1] + q[2]*pose.q[2] + q[3]*pose.q[3] < 0) for (let k = 0; k < 4; k++) q[k] = -q[k];
+  const ls = Math.log(S);
+  const PM = 0.010 * S, LM = 0.010, QM = 0.004; // measurement noise: position px, log-scale, quaternion
+  // ONE shared motion level: if any channel clearly moved, all switch to snappy together (no rotation lagging position).
+  let nisMax = 0;
+  for (let k = 0; k < 3; k++) nisMax = Math.max(nisMax, ch.p[k].nis(raw.p[k], dt, PM, lo * S));
+  nisMax = Math.max(nisMax, ch.ls.nis(ls, dt, LM, lo * 0.6));
+  for (let k = 0; k < 4; k++) nisMax = Math.max(nisMax, ch.q[k].nis(q[k], dt, QM, lo * 0.4));
+  // Ease between "still" and "moving" (fast-ish attack, slower release) instead of switching instantly:
+  // an instant switch is itself a visible jolt. Measured in simulation: −40% jerkiness while moving.
+  const target = smoothstep(nisMax, 1.5, 4), prevB = pose.motion || 0;
+  const boost = prevB + (target - prevB) * (target > prevB ? 0.35 : 0.15);
+  pose.motion = boost;
+  for (let k = 0; k < 3; k++) [pose.p[k], pose.vp[k]] = ch.p[k].step(raw.p[k], dt, PM, lo * S, hi * S, boost);
+  [pose.ls, pose.vls] = ch.ls.step(ls, dt, LM, lo * 0.6, hi * 0.6, boost);
+  for (let k = 0; k < 4; k++) [pose.q[k], pose.vq[k]] = ch.q[k].step(q[k], dt, QM, lo * 0.4, hi * 0.4, boost);
+  // Velocity is noisy; prediction multiplies that noise. Smooth it separately for prediction only.
+  const a = pose.valid ? 0.35 : 1;
+  for (let k = 0; k < 3; k++) pose.sp[k] += a * (pose.vp[k] - pose.sp[k]);
+  for (let k = 0; k < 4; k++) pose.sq[k] += a * (pose.vq[k] - pose.sq[k]);
+  pose.sls += a * (pose.vls - pose.sls);
+  // Motion gate: 0 when the head is still (no prediction => no added shake), 1 when clearly moving.
+  const speed = Math.hypot(...pose.sp) / S;                               // face-widths per second
+  const rspeed = 2 * Math.hypot(pose.sq[0], pose.sq[1], pose.sq[2], pose.sq[3]); // ≈ rad/s
+  const ramp = (x, lo, hi) => { const t = Math.min(1, Math.max(0, (x - lo) / (hi - lo))); return t * t * (3 - 2 * t); };
+  pose.gate = Math.max(ramp(speed, 0.4, 1.5), ramp(rspeed, 0.5, 1.8));
+  pose.valid = true;
+}
+
+const tmpQ = new THREE.Quaternion(), tmpV = new THREE.Vector3();
+// Locked dots: learned face shape transformed by the SAME (filtered) pose as the glasses.
+function updateLockedDots() {
+  if (!showDots || ui.dots !== 'locked' || !rig.dots || ui.rotSrc !== 'rigid' || !anchor.visible) return;
+  const s = anchor.scale.x / ui.fitScale;
+  for (let i = 0; i < rig.dots.length; i++) {
+    tmpV.set(rig.dots[i][0], rig.dots[i][1], rig.dots[i][2]).applyQuaternion(anchor.quaternion).multiplyScalar(s).add(anchor.position);
+    dotPos[i*3] = tmpV.x; dotPos[i*3+1] = tmpV.y; dotPos[i*3+2] = 500;
+  }
+  dotGeo.attributes.position.needsUpdate = true;
+}
+function placeGlasses(ahead) {
+  if (!pose.valid) return;
+  const a = ahead * pose.gate; // prediction only while actually moving
+  anchor.position.set(pose.p[0] + pose.sp[0]*a, pose.p[1] + pose.sp[1]*a, pose.p[2] + pose.sp[2]*a);
+  tmpQ.set(pose.q[0] + pose.sq[0]*a, pose.q[1] + pose.sq[1]*a, pose.q[2] + pose.sq[2]*a, pose.q[3] + pose.sq[3]*a).normalize();
+  anchor.quaternion.copy(tmpQ);
+  anchor.scale.setScalar(Math.exp(pose.ls + pose.sls*a) * ui.fitScale);
+  headGroup.position.copy(anchor.position); headGroup.quaternion.copy(anchor.quaternion);
+  headGroup.scale.setScalar(Math.exp(pose.ls + pose.sls*a));
+  headGroup.visible = anchor.visible;
+  fitGroup.position.set(0, ui.fitY, ui.fitZ);
+}
+
+const jit = { prev:null, v:0 };
+function updateJitter(lm) { // raw nose-bridge movement per frame, as % of eye distance (shown in stats)
+  const p = [lm[168].x * W, lm[168].y * H];
+  if (jit.prev) jit.v = 0.95 * jit.v + 0.05 * Math.hypot(p[0] - jit.prev[0], p[1] - jit.prev[1]) / pose.sRaw * 100;
+  jit.prev = p;
+}
+function updateDebug(lm) {
+  if (!showDots) return;
+  if (ui.dots === 'raw' || !rig.dots || ui.rotSrc !== 'rigid') {
+    for (let i = 0; i < lm.length && i < 478; i++) { dotPos[i*3] = lm[i].x*W; dotPos[i*3+1] = -lm[i].y*H; dotPos[i*3+2] = 500; }
+    dotGeo.attributes.position.needsUpdate = true;
+  }
+  const on = ui.crop, x0 = crop.x0, y0 = crop.y0, s = crop.rs;
+  const c = on ? [x0,-y0, x0+s,-y0, x0+s,-(y0+s), x0,-(y0+s)] : [0,0, 0,0, 0,0, 0,0];
+  for (let i = 0; i < 4; i++) { boxPos[i*3] = c[i*2]; boxPos[i*3+1] = c[i*2+1]; boxPos[i*3+2] = 500; }
+  boxGeo.attributes.position.needsUpdate = true;
+}
+
+// ============================================================
+// STEP 1c: Auto CPU/GPU — benchmark both on this device, keep the faster one
+// STEP 1d: Low-light warning — webcams drop frame rate in dim light
+// ============================================================
+let landmarker, fileset, delegateUsed = '?', bench = null;
+const lmOptions = (delegate) => ({
+  baseOptions: { modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task', delegate },
+  runningMode:'VIDEO', numFaces:1, outputFaceBlendshapes:false, outputFacialTransformationMatrixes:false,
+});
+function benchStep(ms, faceFound) {
+  if (!bench || bench.pending || !faceFound) return;
+  if (++bench.n <= 5) return; // skip warm-up frames
+  bench.sum += ms;
+  if (bench.n < 30) return;
+  bench.res[bench.phase] = bench.sum / 25;
+  if (bench.phase === 'GPU') {
+    bench.pending = true;
+    FaceLandmarker.createFromOptions(fileset, lmOptions('CPU')).then(cpu => {
+      bench.gpu = landmarker; landmarker = cpu; crop.following = false; crop.blend = 0;
+      Object.assign(bench, { phase:'CPU', n:0, sum:0, pending:false });
+    }).catch(() => { delegateUsed = 'GPU'; bench = null; });
+  } else {
+    const useCPU = bench.res.CPU < bench.res.GPU;
+    if (useCPU) bench.gpu.close(); else { landmarker.close(); landmarker = bench.gpu; crop.following = false; crop.blend = 0; }
+    delegateUsed = `${useCPU ? 'CPU' : 'GPU'} (auto: GPU ${bench.res.GPU.toFixed(1)} / CPU ${bench.res.CPU.toFixed(1)} ms)`;
+    bench = null;
+  }
+}
+
+const cam$ = { lastFrames:null, lastT:0, fps:0, lowFor:0 };
+function updateCameraFps(meta, now) {
+  if (!meta || meta.presentedFrames === undefined) return;
+  if (cam$.lastFrames === null) { cam$.lastFrames = meta.presentedFrames; cam$.lastT = now; return; }
+  if (now - cam$.lastT < 1000) return;
+  cam$.fps = (meta.presentedFrames - cam$.lastFrames) * 1000 / (now - cam$.lastT);
+  cam$.lastFrames = meta.presentedFrames; cam$.lastT = now;
+  cam$.lowFor = cam$.fps < 26 ? cam$.lowFor + 1 : 0;
+  const w = $('warn');
+  if (cam$.lowFor >= 2) { w.textContent = `Low light: camera is only giving ${cam$.fps.toFixed(0)} fps. Face a lamp or window for smoother tracking.`; w.style.display = 'block'; }
+  else if (cam$.fps >= 27) w.style.display = 'none';
+}
+
+// ---------- Main loop ----------
+let lastMediaTime = -1, lastT = 0;
+const st = { inf:0, fps:0, frames:0, t0:performance.now(), lat:0, miss:0 };
+
+function onFrame(now, meta) {
+  // Never let one bad frame stop the loop (that is what a "frozen" camera looks like).
+  try { frameBody(now, meta); }
+  catch (e) {
+    console.error(e);
+    const w = $('warn'); w.textContent = 'Error (tracking continues): ' + e.message; w.style.display = 'block';
+  }
+  schedule();
+}
+function frameBody(now, meta) {
+  const mediaTime = meta ? meta.mediaTime : video.currentTime;
+  updateCameraFps(meta, now);
+  if (mediaTime !== lastMediaTime) {
+    const dt = lastMediaTime < 0 ? 1/30 : Math.min(0.1, Math.max(1/120, mediaTime - lastMediaTime));
+    lastMediaTime = mediaTime;
+    const t0 = performance.now();
+    const lm = track(t0, dt);
+    const t1 = performance.now();
+    st.inf = st.inf*0.9 + (t1-t0)*0.1; st.frames++;
+    benchStep(t1 - t0, !!lm);
+    if (meta && meta.captureTime) st.lat = st.lat*0.9 + (t1 - meta.captureTime)*0.1;
+    if (lm) {
+      st.miss = 0;
+      updateCropState(lm, dt);
+      updatePose(measurePose(lm), dt);
+      updateDebug(lm); updateJitter(lm);
+      anchor.visible = true; dots.visible = cropBox.visible = showDots;
+    } else if ((st.missTotal = (st.missTotal || 0) + 1, ++st.miss > 4) || !pose.valid) { // only hide after several missed frames (no flicker on a single miss)
+      anchor.visible = false; headGroup.visible = false; dots.visible = cropBox.visible = false; resetFilters(); crop.following = false;
+    }
+    st.dt = dt;
+    if (ui.mode === 'sync') {
+      vidTex.needsUpdate = true;
+      placeGlasses(ui.lead * dt);
+      updateLockedDots();
+      renderer.render(scene, cam);
+    }
+  }
+  const tn = performance.now();
+  if (tn - st.t0 > 500) {
+    st.fps = st.frames*1000/(tn-st.t0); st.frames = 0; st.t0 = tn;
+    $('stats').textContent =
+      `delegate    ${bench ? 'benchmarking ' + bench.phase + '…' : delegateUsed}\n` +
+      `camera      ${W}x${H} @ ${cam$.fps ? cam$.fps.toFixed(1) : '?'} fps\n` +
+      `detect fps  ${st.fps.toFixed(1)}\ninference   ${st.inf.toFixed(1)} ms\n` +
+      (st.lat ? `capture→pose ${st.lat.toFixed(1)} ms\n` : '') +
+      `crop        ${ui.crop ? (crop.following ? 'following, pred err ' + crop.predErr.toFixed(1) + ' px' : 'searching') : 'off'}\n` + `misses      ${st.missTotal || 0}\n` +
+      `head fit    ${ui.rotSrc === 'rigid' ? (rig.acc ? 'learning face ' + rig.accN + '/' + REF_FRAMES : 'rms ' + rig.rms.toFixed(2) + ' px') : '5 points'}\n` +
+      `motion      ${((pose.motion||0)*100).toFixed(0)}% (0 = smoothing, 100 = snappy)\n` + `predict on  ${(pose.gate*100).toFixed(0)}%\n` + `raw jitter  ${jit.v.toFixed(2)}% (hold still)\n` + `face        ${anchor.visible ? 'yes' : 'no'}`;
+  }
+}
+
+function liveRender() {
+  if (ui.mode === 'live') {
+    const ahead = (pose.valid ? Math.min(0.08, (st.inf + 8) / 1000) : 0) + ui.lead * (st.dt || 1/30);
+    placeGlasses(ahead);
+    updateLockedDots();
+    renderer.render(scene, cam);
+  }
+  requestAnimationFrame(liveRender);
+}
+
+const hasRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+const schedule = () => hasRVFC ? video.requestVideoFrameCallback(onFrame) : requestAnimationFrame(t => onFrame(t, null));
+
+async function start() {
+  $('go').disabled = true; $('go').textContent = 'Loading model…';
+  let stream;
+  [stream, fileset] = await Promise.all([
+    navigator.mediaDevices.getUserMedia({ audio:false, video:{ facingMode:'user', width:{ideal:640}, height:{ideal:480}, frameRate:{ideal:60} } }),
+    FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.1/wasm'),
+  ]);
+  const want = params.get('delegate');
+  if (want === 'CPU') { landmarker = await FaceLandmarker.createFromOptions(fileset, lmOptions('CPU')); delegateUsed = 'CPU (forced)'; }
+  else {
+    try {
+      landmarker = await FaceLandmarker.createFromOptions(fileset, lmOptions('GPU'));
+      delegateUsed = 'GPU';
+      if (want !== 'GPU') bench = { phase:'GPU', n:0, sum:0, res:{}, pending:false };
+      else delegateUsed = 'GPU (forced)';
+    } catch (e) { console.warn('GPU delegate failed, using CPU', e); landmarker = await FaceLandmarker.createFromOptions(fileset, lmOptions('CPU')); delegateUsed = 'CPU (GPU failed)'; }
+  }
+  video.srcObject = stream; await video.play();
+  W = video.videoWidth; H = video.videoHeight;
+  cam.right = W; cam.bottom = -H; cam.updateProjectionMatrix();
+  bg.scale.set(W, H, 1); bg.position.set(W/2, -H/2, -2000);
+  resize(); applyMode();
+  $('start').remove();
+  schedule(); liveRender();
+}
+$('go').onclick = () => start().catch(e => { $('go').textContent = 'Error: ' + e.message; console.error(e); });
+if (params.has('auto')) $('go').click(); // kiosk mode / automated smoke test
+// Debug hook for automated measurement (read-only).
+window.__vto = { get crop(){ return { ...crop }; }, get rig(){ return { rms: rig.rms, learning: !!rig.acc }; }, get pose(){ return { ...pose }; }, get ui(){ return ui; } };
+</script>
+</body>
+</html>
