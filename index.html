@@ -41,8 +41,8 @@
   </label>
   <label>Lens
     <select id="lens">
-      <option value="dark" selected>Dark sun lens + mirror coating</option>
-      <option value="clear">Clear lens + anti-reflective coating</option>
+      <option value="dark">Dark sun lens + mirror coating</option>
+      <option value="clear" selected>Clear lens + anti-reflective coating</option>
     </select>
   </label>
   <label>Render mode
@@ -53,7 +53,7 @@
   </label>
   <label>Head fit <span class="new">step 1</span>
     <select id="rotSrc">
-      <option value="rigid" selected>Rigid 3D fit (38 stable pts)</option>
+      <option value="rigid" selected>Rigid 3D fit (32 stable pts)</option>
       <option value="points">5 landmarks (old)</option>
     </select>
   </label>
@@ -76,8 +76,8 @@
   <details>
     <summary>Fit tweaks &amp; debug</summary>
     <label>arm spread <input type="range" id="armSpread" min="0" max="12" step="0.5" value="4"><span id="armSpreadV">4.00</span>°</label>
-    <label>width <input type="range" id="fitScale" min="0.8" max="1.8" step="0.01" value="1.2"><span id="fitScaleV">1.20</span></label>
-    <label>vertical <input type="range" id="fitY" min="-0.3" max="0.3" step="0.01" value="-0.04"><span id="fitYV">-0.04</span></label>
+    <label>width <input type="range" id="fitScale" min="0.8" max="1.8" step="0.01" value="1.07"><span id="fitScaleV">1.07</span></label>
+    <label>vertical <input type="range" id="fitY" min="-0.3" max="0.3" step="0.01" value="-0.15"><span id="fitYV">-0.15</span></label>
     <label>depth <input type="range" id="fitZ" min="-0.3" max="0.4" step="0.01" value="0.02"><span id="fitZV">0.02</span></label>
     <label>Face-shaped occlusion <input type="checkbox" id="faceOccOn" checked></label>
     <label>Ears hide arm ends <input type="checkbox" id="earsOn" checked></label>
@@ -114,7 +114,7 @@ const $ = id => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 
 // ---------- UI state ----------
-const ui = { mode:'sync', rotSrc:'rigid', crop:true, filter:'kalman', still:1, move:10, lead:0, fitScale:1.2, fitY:-0.04, fitZ:0.02 };
+const ui = { mode:'sync', rotSrc:'rigid', crop:true, filter:'kalman', still:1, move:10, lead:0, fitScale:1.07, fitY:-0.15, fitZ:0.02 };
 const fp = { minCutoff:1.5, beta:4.0 };
 const bindRange = (id, fn) => { const el=$(id); const upd=()=>{ fn(+el.value); const v=$(id+'V'); if(v) v.textContent=(+el.value).toFixed(el.step>=1?0:2); }; el.oninput=upd; upd(); };
 bindRange('still', v=>ui.still=v);
